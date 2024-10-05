@@ -1,0 +1,292 @@
+---
+x-airflow-common: &airflow-common
+  # In order to add custom dependencies or upgrade provider packages you can use your extended image.
+  # Comment the image line, place your Dockerfile in the directory where you placed the docker-compose.yaml
+  # and uncomment the "build" line below, Then run `docker-compose build` to build the images.
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.10.2}
+  # build: .
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+    # Use simple http server on scheduler for health checks
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    hostname: zookeeper
+    container_name: zookeeper
+    restart: unless-stopped
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo 'ruok' | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rdw-network
+
+  kafka_broker:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.1
+    restart: unless-stopped
+    command: |
+      redpanda start
+      --smp 1
+      --overprovisioned
+      --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      --advertise-kafka-addr internal://kafka_broker:9092,external://kafka_broker:19092
+      --schema-registry-addr internal://0.0.0.0:8081,external://kafka_broker:18081
+      --rpc-addr kafka_broker:33145
+      --advertise-rpc-addr kafka_broker:33145
+      --mode dev-container
+      --set auto_create_topics_enabled=true
+    ports:
+      - "18081:18081"
+      - "18082:18082"
+      - "19092:19092"
+      - "19644:9644"
+    networks:
+      - rdw-network
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:v2.5.2
+    restart: unless-stopped
+    entrypoint: /bin/sh
+    command: |-
+      -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    depends_on:
+      - kafka_broker
+    ports:
+      - "8080:8080"
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["kafka_broker:9092"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls:
+              - "http://kafka_broker:9644"
+        connect:
+          enabled: true
+          clusters:
+            - name: local-connect-cluster
+              url: http://connect:8083
+    networks:
+      - rdw-network
+
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    networks:
+      - rdw-network
+
+  redis:
+    image: redis:7.2-bookworm
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - rdw-network
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver --port 8180
+    ports:
+      - "8180:8180"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8180/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - rdw-network
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - rdw-network
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"',
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
+          echo "If you are on Linux, you SHOULD follow the instructions below to set "
+          echo "AIRFLOW_UID environment variable, otherwise files will be owned by root."
+          echo "For other operating systems you can get rid of the warning with manually created .env file:"
+          echo "    See: https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#setting-the-right-airflow-user"
+          echo
+        fi
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: ""
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}:/sources
+    networks:
+      - rdw-network
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+    networks:
+      - rdw-network
+
+  pinot-controller:
+    image: apachepinot/pinot:1.2.0
+    command: "StartController -zkAddress zookeeper:2181"
+    container_name: pinot-controller
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      JAVA_OPTS: "-Dplugins.dir=/opt/pinot/plugins -Xms1G -Xmx1G -XX:+UseG1GC -XX:MaxGCPauseMillis=20"
+    depends_on:
+      - zookeeper
+    networks:
+      - rdw-network
+
+  pinot-server:
+    image: apachepinot/pinot:1.2.0
+    command: "StartServer -zkAddress zookeeper:2181"
+    restart: unless-stopped
+    container_name: "pinot-server"
+    ports:
+      - "8098:8098"
+    environment:
+      JAVA_OPTS: "-Dplugins.dir=/opt/pinot/plugins -Xms1G -Xmx1G -XX:+UseG1GC -XX:MaxGCPauseMillis=20"
+    depends_on:
+      - pinot-broker
+    networks:
+      - rdw-network
+
+  pinot-broker:
+    image: apachepinot/pinot:1.2.0
+    command: "StartBroker -zkAddress zookeeper:2181"
+    restart: unless-stopped
+    container_name: "pinot-broker"
+    ports:
+      - "8099:8099"
+    environment:
+      JAVA_OPTS: "-Dplugins.dir=/opt/pinot/plugins -Xms1G -Xmx1G -XX:+UseG1GC -XX:MaxGCPauseMillis=20"
+    depends_on:
+      - pinot-controller
+    networks:
+      - rdw-network
+
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: superset
+    restart: unless-stopped
+    environment:
+      - ADMIN_USERNAME=admin
+      - ADMIN_EMAIL=admin@superset.com
+      - ADMIN_PASSWORD=admin
+    ports:
+      - "8088:8088"
+    networks:
+      - rdw-network
+
+networks:
+  rdw-network:
+
+volumes:
+  postgres-db-volume:
