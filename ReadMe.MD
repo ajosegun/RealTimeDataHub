@@ -17,8 +17,6 @@ RealTimeDataHub is a real-time data warehouse from scratch using technologies li
 
 In today's data-driven world, businesses require real-time insights to stay competitive. Traditional batch processing is no longer sufficient for timely decision-making. RealTimeDataHub solves this by implementing a real-time data warehouse that processes streaming data from a simulated financial institution and visualizes it using Apache Superset.
 
-
-
 ## Architecture
 
 The architecture of RealTimeDataHub consists of the following components:
@@ -29,7 +27,7 @@ The architecture of RealTimeDataHub consists of the following components:
 - **Redpanda**: A Kafka-compatible streaming data platform built for data-intensive applications.
 - **Apache Superset**: Provides real-time data visualization and dashboarding capabilities.
 
-![Architecture Diagram](./path-to-architecture-diagram.png)
+![Architecture Diagram](./images/architecture-diagram.png)
 
 ## Tech Stack
 
@@ -74,10 +72,40 @@ The architecture of RealTimeDataHub consists of the following components:
 
 4. **Run the initial setup**:
    Initialize the Airflow environment, databases, and schemas:
+
    ```bash
    docker exec -it airflow-webserver airflow db init
    ```
 
+5. Apache Superset
+   Add Pinot as a database
+   `pinot://pinot-broker:8099/query?server=http://pinot-controller:9000/`
 
-**PREVIEW**
+   ![Add Pinot as a database](./images/add-pinot-as-a-database.png)
 
+   Create a new dashboard and add the following query
+
+   ```sql
+       SELECT
+       tf.*,
+       cd.first_name || ' ' || cd.last_name AS full_name,
+       email,
+       phone_number,
+       registration_date,
+       branch_name,
+       branch_address,
+       city,
+       state,
+       zipcode,
+       account_type,
+       status,
+       balance
+   FROM
+       transaction_facts tf
+   LEFT JOIN
+       account_dim ad ON tf.account_id = ad.account_id
+   LEFT JOIN
+       customer_dim cd ON tf.customer_id = cd.customer_id
+   LEFT JOIN
+       branch_dim bd ON tf.branch_id = bd.branch_id;
+   ```
