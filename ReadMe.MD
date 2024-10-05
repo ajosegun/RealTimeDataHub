@@ -17,6 +17,8 @@ RealTimeDataHub is a real-time data warehouse from scratch using technologies li
 
 In today's data-driven world, businesses require real-time insights to stay competitive. Traditional batch processing is no longer sufficient for timely decision-making. RealTimeDataHub solves this by implementing a real-time data warehouse that processes streaming data from a simulated financial institution and visualizes it using Apache Superset.
 
+
+
 ## Architecture
 
 The architecture of RealTimeDataHub consists of the following components:
@@ -75,3 +77,7 @@ The architecture of RealTimeDataHub consists of the following components:
    ```bash
    docker exec -it airflow-webserver airflow db init
    ```
+
+
+**PREVIEW**
+
